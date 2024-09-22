@@ -342,7 +342,6 @@ pub fn cpu_info() -> Option<Vec<CpuInfo>> {
   }
 }
 
-
 #[cfg(test)]
 mod tests {
   use super::*;
