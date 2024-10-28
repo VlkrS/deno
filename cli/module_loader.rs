@@ -23,6 +23,7 @@ use crate::graph_container::ModuleGraphUpdatePermit;
 use crate::graph_util::CreateGraphOptions;
 use crate::graph_util::ModuleGraphBuilder;
 use crate::node;
+use crate::npm::CliNpmResolver;
 use crate::resolver::CliGraphResolver;
 use crate::resolver::CliNodeResolver;
 use crate::resolver::ModuleCodeStringSource;
@@ -104,7 +105,7 @@ impl ModuleLoadPreparer {
     roots: &[ModuleSpecifier],
     is_dynamic: bool,
     lib: TsTypeLib,
-    permissions: crate::file_fetcher::FetchPermissionsOption,
+    permissions: PermissionsContainer,
     ext_overwrite: Option<&String>,
   ) -> Result<(), AnyError> {
     log::debug!("Preparing module load.");
@@ -203,6 +204,7 @@ struct SharedCliModuleLoaderState {
   main_module_graph_container: Arc<MainModuleGraphContainer>,
   module_load_preparer: Arc<ModuleLoadPreparer>,
   node_resolver: Arc<CliNodeResolver>,
+  npm_resolver: Arc<dyn CliNpmResolver>,
   npm_module_loader: NpmModuleLoader,
   parsed_source_cache: Arc<ParsedSourceCache>,
   resolver: Arc<CliGraphResolver>,
@@ -221,6 +223,7 @@ impl CliModuleLoaderFactory {
     main_module_graph_container: Arc<MainModuleGraphContainer>,
     module_load_preparer: Arc<ModuleLoadPreparer>,
     node_resolver: Arc<CliNodeResolver>,
+    npm_resolver: Arc<dyn CliNpmResolver>,
     npm_module_loader: NpmModuleLoader,
     parsed_source_cache: Arc<ParsedSourceCache>,
     resolver: Arc<CliGraphResolver>,
@@ -241,6 +244,7 @@ impl CliModuleLoaderFactory {
         main_module_graph_container,
         module_load_preparer,
         node_resolver,
+        npm_resolver,
         npm_module_loader,
         parsed_source_cache,
         resolver,
@@ -252,13 +256,15 @@ impl CliModuleLoaderFactory {
     &self,
     graph_container: TGraphContainer,
     lib: TsTypeLib,
-    root_permissions: PermissionsContainer,
-    dynamic_permissions: PermissionsContainer,
+    is_worker: bool,
+    parent_permissions: PermissionsContainer,
+    permissions: PermissionsContainer,
   ) -> ModuleLoaderAndSourceMapGetter {
     let loader = Rc::new(CliModuleLoader(Rc::new(CliModuleLoaderInner {
       lib,
-      root_permissions,
-      dynamic_permissions,
+      is_worker,
+      parent_permissions,
+      permissions,
       graph_container,
       emitter: self.shared.emitter.clone(),
       parsed_source_cache: self.shared.parsed_source_cache.clone(),
@@ -274,20 +280,20 @@ impl ModuleLoaderFactory for CliModuleLoaderFactory {
   fn create_for_main(
     &self,
     root_permissions: PermissionsContainer,
-    dynamic_permissions: PermissionsContainer,
   ) -> ModuleLoaderAndSourceMapGetter {
     self.create_with_lib(
       (*self.shared.main_module_graph_container).clone(),
       self.shared.lib_window,
+      /* is worker */ false,
+      root_permissions.clone(),
       root_permissions,
-      dynamic_permissions,
     )
   }
 
   fn create_for_worker(
     &self,
-    root_permissions: PermissionsContainer,
-    dynamic_permissions: PermissionsContainer,
+    parent_permissions: PermissionsContainer,
+    permissions: PermissionsContainer,
   ) -> ModuleLoaderAndSourceMapGetter {
     self.create_with_lib(
       // create a fresh module graph for the worker
@@ -295,21 +301,21 @@ impl ModuleLoaderFactory for CliModuleLoaderFactory {
         self.shared.graph_kind,
       ))),
       self.shared.lib_worker,
-      root_permissions,
-      dynamic_permissions,
+      /* is worker */ true,
+      parent_permissions,
+      permissions,
     )
   }
 }
 
 struct CliModuleLoaderInner<TGraphContainer: ModuleGraphContainer> {
   lib: TsTypeLib,
+  is_worker: bool,
   /// The initial set of permissions used to resolve the static imports in the
   /// worker. These are "allow all" for main worker, and parent thread
   /// permissions for Web Worker.
-  root_permissions: PermissionsContainer,
-  /// Permissions used to resolve dynamic imports, these get passed as
-  /// "root permissions" for Web Worker.
-  dynamic_permissions: PermissionsContainer,
+  parent_permissions: PermissionsContainer,
+  permissions: PermissionsContainer,
   shared: Arc<SharedCliModuleLoaderState>,
   emitter: Arc<Emitter>,
   parsed_source_cache: Arc<ParsedSourceCache>,
@@ -325,15 +331,23 @@ impl<TGraphContainer: ModuleGraphContainer>
     maybe_referrer: Option<&ModuleSpecifier>,
     requested_module_type: RequestedModuleType,
   ) -> Result<ModuleSource, AnyError> {
-    let code_source = if let Some(result) = self
-      .shared
-      .npm_module_loader
-      .load_if_in_npm_package(specifier, maybe_referrer)
-      .await
-    {
-      result?
-    } else {
-      self.load_prepared_module(specifier, maybe_referrer).await?
+    let code_source = match self.load_prepared_module(specifier).await? {
+      Some(code_source) => code_source,
+      None => {
+        if self.shared.npm_module_loader.if_in_npm_package(specifier) {
+          self
+            .shared
+            .npm_module_loader
+            .load(specifier, maybe_referrer)
+            .await?
+        } else {
+          let mut msg = format!("Loading unprepared module: {specifier}");
+          if let Some(referrer) = maybe_referrer {
+            msg = format!("{}, imported from: {}", msg, referrer.as_str());
+          }
+          return Err(anyhow!(msg));
+        }
+      }
     };
     let code = if self.shared.is_inspecting {
       // we need the code with the source map in order for
@@ -476,7 +490,6 @@ impl<TGraphContainer: ModuleGraphContainer>
       Some(Module::Npm(module)) => {
         let package_folder = self
           .shared
-          .node_resolver
           .npm_resolver
           .as_managed()
           .unwrap() // byonm won't create a Module::Npm
@@ -509,17 +522,12 @@ impl<TGraphContainer: ModuleGraphContainer>
   async fn load_prepared_module(
     &self,
     specifier: &ModuleSpecifier,
-    maybe_referrer: Option<&ModuleSpecifier>,
-  ) -> Result<ModuleCodeStringSource, AnyError> {
+  ) -> Result<Option<ModuleCodeStringSource>, AnyError> {
     // Note: keep this in sync with the sync version below
     let graph = self.graph_container.graph();
-    match self.load_prepared_module_or_defer_emit(
-      &graph,
-      specifier,
-      maybe_referrer,
-    ) {
-      Ok(CodeOrDeferredEmit::Code(code_source)) => Ok(code_source),
-      Ok(CodeOrDeferredEmit::DeferredEmit {
+    match self.load_prepared_module_or_defer_emit(&graph, specifier)? {
+      Some(CodeOrDeferredEmit::Code(code_source)) => Ok(Some(code_source)),
+      Some(CodeOrDeferredEmit::DeferredEmit {
         specifier,
         media_type,
         source,
@@ -532,30 +540,26 @@ impl<TGraphContainer: ModuleGraphContainer>
         // at this point, we no longer need the parsed source in memory, so free it
         self.parsed_source_cache.free(specifier);
 
-        Ok(ModuleCodeStringSource {
-          code: ModuleSourceCode::Bytes(transpile_result),
+        Ok(Some(ModuleCodeStringSource {
+          // note: it's faster to provide a string if we know it's a string
+          code: ModuleSourceCode::String(transpile_result.into()),
           found_url: specifier.clone(),
           media_type,
-        })
+        }))
       }
-      Err(err) => Err(err),
+      None => Ok(None),
     }
   }
 
   fn load_prepared_module_sync(
     &self,
     specifier: &ModuleSpecifier,
-    maybe_referrer: Option<&ModuleSpecifier>,
-  ) -> Result<ModuleCodeStringSource, AnyError> {
+  ) -> Result<Option<ModuleCodeStringSource>, AnyError> {
     // Note: keep this in sync with the async version above
     let graph = self.graph_container.graph();
-    match self.load_prepared_module_or_defer_emit(
-      &graph,
-      specifier,
-      maybe_referrer,
-    ) {
-      Ok(CodeOrDeferredEmit::Code(code_source)) => Ok(code_source),
-      Ok(CodeOrDeferredEmit::DeferredEmit {
+    match self.load_prepared_module_or_defer_emit(&graph, specifier)? {
+      Some(CodeOrDeferredEmit::Code(code_source)) => Ok(Some(code_source)),
+      Some(CodeOrDeferredEmit::DeferredEmit {
         specifier,
         media_type,
         source,
@@ -567,13 +571,14 @@ impl<TGraphContainer: ModuleGraphContainer>
         // at this point, we no longer need the parsed source in memory, so free it
         self.parsed_source_cache.free(specifier);
 
-        Ok(ModuleCodeStringSource {
-          code: ModuleSourceCode::Bytes(transpile_result),
+        Ok(Some(ModuleCodeStringSource {
+          // note: it's faster to provide a string if we know it's a string
+          code: ModuleSourceCode::String(transpile_result.into()),
           found_url: specifier.clone(),
           media_type,
-        })
+        }))
       }
-      Err(err) => Err(err),
+      None => Ok(None),
     }
   }
 
@@ -581,8 +586,7 @@ impl<TGraphContainer: ModuleGraphContainer>
     &self,
     graph: &'graph ModuleGraph,
     specifier: &ModuleSpecifier,
-    maybe_referrer: Option<&ModuleSpecifier>,
-  ) -> Result<CodeOrDeferredEmit<'graph>, AnyError> {
+  ) -> Result<Option<CodeOrDeferredEmit<'graph>>, AnyError> {
     if specifier.scheme() == "node" {
       // Node built-in modules should be handled internally.
       unreachable!("Deno bug. {} was misconfigured internally.", specifier);
@@ -594,11 +598,11 @@ impl<TGraphContainer: ModuleGraphContainer>
         media_type,
         specifier,
         ..
-      })) => Ok(CodeOrDeferredEmit::Code(ModuleCodeStringSource {
+      })) => Ok(Some(CodeOrDeferredEmit::Code(ModuleCodeStringSource {
         code: ModuleSourceCode::String(source.clone().into()),
         found_url: specifier.clone(),
         media_type: *media_type,
-      })),
+      }))),
       Some(deno_graph::Module::Js(JsModule {
         source,
         media_type,
@@ -619,11 +623,11 @@ impl<TGraphContainer: ModuleGraphContainer>
           | MediaType::Cts
           | MediaType::Jsx
           | MediaType::Tsx => {
-            return Ok(CodeOrDeferredEmit::DeferredEmit {
+            return Ok(Some(CodeOrDeferredEmit::DeferredEmit {
               specifier,
               media_type: *media_type,
               source,
-            });
+            }));
           }
           MediaType::TsBuildInfo | MediaType::Wasm | MediaType::SourceMap => {
             panic!("Unexpected media type {media_type} for {specifier}")
@@ -633,24 +637,18 @@ impl<TGraphContainer: ModuleGraphContainer>
         // at this point, we no longer need the parsed source in memory, so free it
         self.parsed_source_cache.free(specifier);
 
-        Ok(CodeOrDeferredEmit::Code(ModuleCodeStringSource {
+        Ok(Some(CodeOrDeferredEmit::Code(ModuleCodeStringSource {
           code: ModuleSourceCode::String(code),
           found_url: specifier.clone(),
           media_type: *media_type,
-        }))
+        })))
       }
       Some(
         deno_graph::Module::External(_)
         | deno_graph::Module::Node(_)
         | deno_graph::Module::Npm(_),
       )
-      | None => {
-        let mut msg = format!("Loading unprepared module: {specifier}");
-        if let Some(referrer) = maybe_referrer {
-          msg = format!("{}, imported from: {}", msg, referrer.as_str());
-        }
-        Err(anyhow!(msg))
-      }
+      | None => Ok(None),
     }
   }
 }
@@ -769,11 +767,12 @@ impl<TGraphContainer: ModuleGraphContainer> ModuleLoader
         }
       }
 
-      let root_permissions = if is_dynamic {
-        inner.dynamic_permissions.clone()
+      let permissions = if is_dynamic {
+        inner.permissions.clone()
       } else {
-        inner.root_permissions.clone()
+        inner.parent_permissions.clone()
       };
+      let is_dynamic = is_dynamic || inner.is_worker; // consider workers as dynamic for permissions
       let lib = inner.lib;
       let mut update_permit = graph_container.acquire_update_permit().await;
       let graph = update_permit.graph_mut();
@@ -783,7 +782,7 @@ impl<TGraphContainer: ModuleGraphContainer> ModuleLoader
           &[specifier],
           is_dynamic,
           lib,
-          root_permissions.into(),
+          permissions,
           None,
         )
         .await?;
@@ -822,7 +821,7 @@ impl<TGraphContainer: ModuleGraphContainer> ModuleLoader
       "wasm" | "file" | "http" | "https" | "data" | "blob" => (),
       _ => return None,
     }
-    let source = self.0.load_prepared_module_sync(&specifier, None).ok()?;
+    let source = self.0.load_prepared_module_sync(&specifier).ok()??;
     source_map_from_code(source.code.as_bytes())
   }
 

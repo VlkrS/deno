@@ -43,7 +43,9 @@
       // TODO(littledivy): windows ipc streams not yet implemented
       "test-child-process-fork-ref.js",
       "test-child-process-fork-ref2.js",
-      "test-child-process-ipc-next-tick.js",
+      // TODO(bartlomieju): this test is very flaky on CI
+      // https://github.com/denoland/deno/issues/25855
+      // "test-child-process-ipc-next-tick.js",
       "test-child-process-ipc.js",
       "test-child-process-spawnsync-env.js",
       "test-child-process-stdio-inherit.js",
@@ -404,6 +406,7 @@
       "test-http-outgoing-settimeout.js",
       "test-http-url.parse-https.request.js",
       "test-http-url.parse-only-support-http-https-protocol.js",
+      "test-icu-transcode.js",
       "test-net-access-byteswritten.js",
       "test-net-better-error-messages-listen-path.js",
       "test-net-better-error-messages-path.js",
@@ -436,6 +439,7 @@
       "test-net-server-unref.js",
       "test-net-socket-destroy-twice.js",
       "test-net-socket-no-halfopen-enforcer.js",
+      "test-net-socket-setnodelay.js",
       "test-net-timeout-no-handle.js",
       "test-net-write-arguments.js",
       "test-next-tick-doesnt-hang.js",

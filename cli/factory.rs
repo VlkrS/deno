@@ -14,6 +14,7 @@ use crate::cache::CodeCache;
 use crate::cache::DenoDir;
 use crate::cache::DenoDirProvider;
 use crate::cache::EmitCache;
+use crate::cache::EsmOrCjsChecker;
 use crate::cache::GlobalHttpCache;
 use crate::cache::HttpCache;
 use crate::cache::LocalHttpCache;
@@ -32,17 +33,19 @@ use crate::module_loader::ModuleLoadPreparer;
 use crate::node::CliCjsCodeAnalyzer;
 use crate::node::CliNodeCodeTranslator;
 use crate::npm::create_cli_npm_resolver;
+use crate::npm::CliByonmNpmResolverCreateOptions;
 use crate::npm::CliNpmResolver;
-use crate::npm::CliNpmResolverByonmCreateOptions;
 use crate::npm::CliNpmResolverCreateOptions;
 use crate::npm::CliNpmResolverManagedCreateOptions;
 use crate::npm::CliNpmResolverManagedSnapshotOption;
 use crate::resolver::CjsResolutionStore;
+use crate::resolver::CliDenoResolverFs;
 use crate::resolver::CliGraphResolver;
 use crate::resolver::CliGraphResolverOptions;
 use crate::resolver::CliNodeResolver;
+use crate::resolver::CliSloppyImportsResolver;
 use crate::resolver::NpmModuleLoader;
-use crate::resolver::SloppyImportsResolver;
+use crate::resolver::SloppyImportsCachedFs;
 use crate::standalone::DenoCompileBinaryWriter;
 use crate::tools::check::TypeChecker;
 use crate::tools::coverage::CoverageCollector;
@@ -169,6 +172,7 @@ struct CliFactoryServices {
   http_client_provider: Deferred<Arc<HttpClientProvider>>,
   emit_cache: Deferred<Arc<EmitCache>>,
   emitter: Deferred<Arc<Emitter>>,
+  esm_or_cjs_checker: Deferred<Arc<EsmOrCjsChecker>>,
   fs: Deferred<Arc<dyn deno_fs::FileSystem>>,
   main_graph_container: Deferred<Arc<MainModuleGraphContainer>>,
   maybe_inspector_server: Deferred<Option<Arc<InspectorServer>>>,
@@ -185,7 +189,8 @@ struct CliFactoryServices {
   node_resolver: Deferred<Arc<NodeResolver>>,
   npm_resolver: Deferred<Arc<dyn CliNpmResolver>>,
   permission_desc_parser: Deferred<Arc<RuntimePermissionDescriptorParser>>,
-  sloppy_imports_resolver: Deferred<Option<Arc<SloppyImportsResolver>>>,
+  root_permissions_container: Deferred<PermissionsContainer>,
+  sloppy_imports_resolver: Deferred<Option<Arc<CliSloppyImportsResolver>>>,
   text_only_progress_bar: Deferred<ProgressBar>,
   type_checker: Deferred<Arc<TypeChecker>>,
   cjs_resolutions: Deferred<Arc<CjsResolutionStore>>,
@@ -295,10 +300,16 @@ impl CliFactory {
       .get_or_init(|| ProgressBar::new(ProgressBarStyle::TextOnly))
   }
 
+  pub fn esm_or_cjs_checker(&self) -> &Arc<EsmOrCjsChecker> {
+    self.services.esm_or_cjs_checker.get_or_init(|| {
+      Arc::new(EsmOrCjsChecker::new(self.parsed_source_cache().clone()))
+    })
+  }
+
   pub fn global_http_cache(&self) -> Result<&Arc<GlobalHttpCache>, AnyError> {
     self.services.global_http_cache.get_or_try_init(|| {
       Ok(Arc::new(GlobalHttpCache::new(
-        self.deno_dir()?.deps_folder_path(),
+        self.deno_dir()?.remote_folder_path(),
         crate::cache::RealDenoCacheEnv,
       )))
     })
@@ -359,8 +370,8 @@ impl CliFactory {
         let cli_options = self.cli_options()?;
         // For `deno install` we want to force the managed resolver so it can set up `node_modules/` directory.
         create_cli_npm_resolver(if cli_options.use_byonm() && !matches!(cli_options.sub_command(), DenoSubcommand::Install(_) | DenoSubcommand::Add(_) | DenoSubcommand::Remove(_)) {
-          CliNpmResolverCreateOptions::Byonm(CliNpmResolverByonmCreateOptions {
-            fs: fs.clone(),
+          CliNpmResolverCreateOptions::Byonm(CliByonmNpmResolverCreateOptions {
+            fs: CliDenoResolverFs(fs.clone()),
             root_node_modules_dir: Some(match cli_options.node_modules_dir_path() {
               Some(node_modules_path) => node_modules_path.to_path_buf(),
               // path needs to be canonicalized for node resolution
@@ -403,17 +414,16 @@ impl CliFactory {
 
   pub fn sloppy_imports_resolver(
     &self,
-  ) -> Result<Option<&Arc<SloppyImportsResolver>>, AnyError> {
+  ) -> Result<Option<&Arc<CliSloppyImportsResolver>>, AnyError> {
     self
       .services
       .sloppy_imports_resolver
       .get_or_try_init(|| {
-        Ok(
-          self
-            .cli_options()?
-            .unstable_sloppy_imports()
-            .then(|| Arc::new(SloppyImportsResolver::new(self.fs().clone()))),
-        )
+        Ok(self.cli_options()?.unstable_sloppy_imports().then(|| {
+          Arc::new(CliSloppyImportsResolver::new(SloppyImportsCachedFs::new(
+            self.fs().clone(),
+          )))
+        }))
       })
       .map(|maybe| maybe.as_ref())
   }
@@ -577,6 +587,7 @@ impl CliFactory {
           node_analysis_cache,
           self.fs().clone(),
           node_resolver,
+          Some(self.parsed_source_cache().clone()),
         );
 
         Ok(Arc::new(NodeCodeTranslator::new(
@@ -617,8 +628,10 @@ impl CliFactory {
         Ok(Arc::new(ModuleGraphBuilder::new(
           cli_options.clone(),
           self.caches()?.clone(),
+          self.esm_or_cjs_checker().clone(),
           self.fs().clone(),
           self.resolver().await?.clone(),
+          self.cli_node_resolver().await?.clone(),
           self.npm_resolver().await?.clone(),
           self.module_info_cache()?.clone(),
           self.parsed_source_cache().clone(),
@@ -626,6 +639,7 @@ impl CliFactory {
           self.maybe_file_watcher_reporter().clone(),
           self.file_fetcher()?.clone(),
           self.global_http_cache()?.clone(),
+          self.root_permissions_container()?.clone(),
         )))
       })
       .await
@@ -659,6 +673,7 @@ impl CliFactory {
         Ok(Arc::new(MainModuleGraphContainer::new(
           self.cli_options()?.clone(),
           self.module_load_preparer().await?.clone(),
+          self.root_permissions_container()?.clone(),
         )))
       })
       .await
@@ -747,6 +762,7 @@ impl CliFactory {
     let cli_options = self.cli_options()?;
     Ok(DenoCompileBinaryWriter::new(
       self.deno_dir()?,
+      self.emitter()?,
       self.file_fetcher()?,
       self.http_client_provider(),
       self.npm_resolver().await?.as_ref(),
@@ -755,15 +771,20 @@ impl CliFactory {
     ))
   }
 
-  pub fn create_permissions_container(
+  pub fn root_permissions_container(
     &self,
-  ) -> Result<PermissionsContainer, AnyError> {
-    let desc_parser = self.permission_desc_parser()?.clone();
-    let permissions = Permissions::from_options(
-      desc_parser.as_ref(),
-      &self.cli_options()?.permissions_options(),
-    )?;
-    Ok(PermissionsContainer::new(desc_parser, permissions))
+  ) -> Result<&PermissionsContainer, AnyError> {
+    self
+      .services
+      .root_permissions_container
+      .get_or_try_init(|| {
+        let desc_parser = self.permission_desc_parser()?.clone();
+        let permissions = Permissions::from_options(
+          desc_parser.as_ref(),
+          &self.cli_options()?.permissions_options(),
+        )?;
+        Ok(PermissionsContainer::new(desc_parser, permissions))
+      })
   }
 
   pub async fn create_cli_main_worker_factory(
@@ -774,6 +795,7 @@ impl CliFactory {
     let npm_resolver = self.npm_resolver().await?;
     let fs = self.fs();
     let cli_node_resolver = self.cli_node_resolver().await?;
+    let cli_npm_resolver = self.npm_resolver().await?.clone();
     let maybe_file_watcher_communicator = if cli_options.has_hmr() {
       Some(self.watcher_communicator.clone().unwrap())
     } else {
@@ -782,6 +804,7 @@ impl CliFactory {
 
     Ok(CliMainWorkerFactory::new(
       self.blob_store().clone(),
+      self.cjs_resolutions().clone(),
       if cli_options.code_cache_enabled() {
         Some(self.code_cache()?.clone())
       } else {
@@ -803,6 +826,7 @@ impl CliFactory {
         self.main_module_graph_container().await?.clone(),
         self.module_load_preparer().await?.clone(),
         cli_node_resolver.clone(),
+        cli_npm_resolver.clone(),
         NpmModuleLoader::new(
           self.cjs_resolutions().clone(),
           self.node_code_translator().await?.clone(),
@@ -814,8 +838,8 @@ impl CliFactory {
       )),
       node_resolver.clone(),
       npm_resolver.clone(),
-      self.permission_desc_parser()?.clone(),
       self.root_cert_store_provider().clone(),
+      self.root_permissions_container()?.clone(),
       StorageKeyResolver::from_options(cli_options),
       cli_options.sub_command().clone(),
       self.create_cli_main_worker_options()?,
@@ -885,6 +909,7 @@ impl CliFactory {
       node_ipc: cli_options.node_ipc_fd(),
       serve_port: cli_options.serve_port(),
       serve_host: cli_options.serve_host(),
+      unstable_detect_cjs: cli_options.unstable_detect_cjs(),
     })
   }
 }
